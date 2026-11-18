@@ -1,6 +1,7 @@
 import unittest
-from watcher import Policy, parse_access
+from watcher import Policy, parse_access, suspend
 from datetime import datetime
+from unittest.mock import patch
 
 
 class PolicyTests(unittest.TestCase):
@@ -73,6 +74,98 @@ class PolicyTests(unittest.TestCase):
         p = Policy(owned=True)
         self.assertIsNone(p.step(100, 'desktop', True, False, 99))
         self.assertIsNone(p.step(500, 'desktop', True, False, 99))
+
+
+class SuspendTests(unittest.TestCase):
+    def returned_to_game(self):
+        p = Policy(owned=True)
+        p.requested('game', 100)
+        p.step(110, 'game', False, False, 0)
+        return p
+
+    def test_only_arms_after_confirmed_managed_return(self):
+        p = Policy(owned=True)
+        p.requested('game', 100)
+        p.step(105, 'desktop', False, False, 0)
+        self.assertIsNone(p.suspend_at)
+        p.step(110, 'game', False, False, 0)
+        self.assertEqual(p.suspend_at, 140)
+
+    def test_no_sleep_on_ordinary_game_startup(self):
+        p = Policy()
+        self.assertIsNone(p.step(1000, 'game', False, False, 0))
+        self.assertIsNone(p.step(2000, 'game', False, False, 0))
+        self.assertIsNone(p.suspend_at)
+
+    def test_full_thirty_second_window(self):
+        p = self.returned_to_game()
+        self.assertIsNone(p.step(139, 'game', False, False, 0))
+        self.assertEqual(p.step(140, 'game', False, False, 0), 'suspend')
+
+    def test_reconnect_cancels_at_deadline(self):
+        p = self.returned_to_game()
+        self.assertIsNone(p.step(140, 'game', True, False, 140))
+        self.assertIsNone(p.suspend_at)
+        self.assertIsNone(p.step(1000, 'game', False, False, 0))
+
+    def test_pending_or_other_connection_cancels(self):
+        p = self.returned_to_game()
+        self.assertIsNone(p.step(140, 'game', False, True, 0))
+        self.assertIsNone(p.suspend_at)
+        self.assertIsNone(p.step(1000, 'game', False, False, 0))
+
+    def test_unknown_mode_cancels(self):
+        p = self.returned_to_game()
+        p.step(139, 'unknown', False, False, 0)
+        self.assertIsNone(p.suspend_at)
+        self.assertIsNone(p.step(1000, 'game', False, False, 0))
+
+    def test_manual_desktop_cancels(self):
+        p = self.returned_to_game()
+        p.step(139, 'desktop', False, False, 0)
+        self.assertIsNone(p.suspend_at)
+        self.assertIsNone(p.step(1000, 'game', False, False, 0))
+
+    def test_safety_pause_cancels(self):
+        p = self.returned_to_game()
+        p.paused_reason = 'test fault'
+        self.assertIsNone(p.step(140, 'game', False, False, 0))
+        self.assertIsNone(p.suspend_at)
+
+    def test_countdown_consumed_before_suspend_and_not_rearmed_on_wake(self):
+        p = self.returned_to_game()
+        self.assertEqual(p.step(140, 'game', False, False, 0), 'suspend')
+        p.requested('suspend', 140)
+        self.assertIsNone(p.suspend_at)
+        self.assertEqual(p.transition, '')
+        self.assertIsNone(p.step(141, 'game', False, False, 0))
+        self.assertIsNone(p.step(5000, 'game', False, False, 0))
+
+    def test_connection_during_switch_prevents_sleep_and_can_enter_kde(self):
+        p = Policy(owned=True)
+        p.requested('game', 100)
+        p.step(110, 'game', True, False, 105)
+        self.assertIsNone(p.suspend_at)
+        self.assertIsNone(p.step(111, 'game', True, False, 105))
+        self.assertEqual(p.step(116, 'game', True, False, 105), 'desktop')
+
+    def test_pending_connection_at_confirmation_does_not_arm(self):
+        p = Policy(owned=True)
+        p.requested('game', 100)
+        p.step(110, 'game', False, True, 0)
+        self.assertIsNone(p.suspend_at)
+        self.assertIsNone(p.step(1000, 'game', False, False, 0))
+
+    def test_old_state_without_suspend_field_loads(self):
+        p = Policy(owned=True, transition='', log_size=20)
+        self.assertIsNone(p.suspend_at)
+
+    @patch('watcher.log')
+    @patch('watcher.command')
+    def test_suspend_is_noninteractive_and_honors_inhibitors(self, run, _log):
+        suspend()
+        run.assert_called_once_with(['systemctl', '--no-ask-password',
+                                     '--check-inhibitors=yes', '--no-block', 'suspend'])
 
 
 class AccessTests(unittest.TestCase):

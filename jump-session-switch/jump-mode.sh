@@ -16,6 +16,7 @@ case "${1:-status}" in
         printf 'Enabling session automation. Current applications may close and Jump may disconnect.\n'
         printf 'Authenticated Jump connection -> KDE after 5 seconds.\n'
         printf 'No connections -> Gaming Mode after 2 minutes, with a 5-minute switch grace period.\n'
+        printf 'Then suspend after a 30-second reconnect cancellation window (unless sleep-off is set).\n'
         if [[ -e "$unit" ]] && ! cmp -s "$base/$name" "$unit"; then
             printf 'Existing unit differs from our template; refusing to overwrite it.\n' >&2
             exit 1
@@ -59,6 +60,14 @@ PY
         systemctl --user start "$name"
         printf 'Resumed unless a safety fault is recorded. Use status to check.\n'
         ;;
+    sleep-off)
+        touch "$state/no-suspend"
+        printf 'Automatic suspend disabled; session switching remains enabled.\n'
+        ;;
+    sleep-on)
+        rm -f "$state/no-suspend"
+        printf 'Automatic suspend enabled for the next managed return to Gaming Mode.\n'
+        ;;
     reset)
         touch "$state/paused"
         systemctl --user stop "$name" || true
@@ -79,7 +88,17 @@ import json,sys
 s=json.load(open(sys.argv[1]))
 print('\nManaged KDE:', s.get('owned'), '| transition:', s.get('transition'))
 print('Safety pause:', s.get('paused_reason') or 'none')
+if s.get('suspend_at') is not None:
+    import time
+    print('Suspend countdown:', max(0, round(s['suspend_at']-time.monotonic())), 'seconds remaining')
+else:
+    print('Suspend countdown: none')
 PY
+        fi
+        if [[ -e "$state/no-suspend" ]]; then
+            printf 'Automatic suspend: disabled\n'
+        else
+            printf 'Automatic suspend: enabled (30 seconds after managed Gaming Mode return)\n'
         fi
         ;;
     logs)
@@ -103,7 +122,7 @@ PY
         fi
         ;;
     *)
-        printf 'Usage: bash ~/jump-mode.sh {enable|disable|pause|resume|reset|status|logs|rollback}\n' >&2
+        printf 'Usage: bash ~/jump-mode.sh {enable|disable|pause|resume|sleep-off|sleep-on|reset|status|logs|rollback}\n' >&2
         exit 2
         ;;
 esac

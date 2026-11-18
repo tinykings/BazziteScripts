@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jump authentication -> KDE; confirmed disconnect -> Gaming Mode.
+"""Jump authentication -> KDE; disconnect -> Gaming Mode -> suspend.
 
 Uses Jump's public access log and Bazzite's supported steamosctl API.
 Never modifies or restarts Jump. Unknown state inhibits switching.
@@ -26,6 +26,7 @@ CONNECT_DELAY = 5
 DISCONNECT_DELAY = 120
 HANDOFF_GRACE = 300
 SWITCH_TIMEOUT = 90
+SUSPEND_DELAY = 30
 
 
 def log(message):
@@ -138,19 +139,28 @@ class Policy:
     jump_pid: str = ''
     log_identity: str = ''
     log_size: int = 0
+    suspend_at: float | None = None
 
     def step(self, now, mode, connected, others, latest_auth):
         if self.paused_reason:
+            self.suspend_at = None
             return None
+        # A connection attempt, another session, or uncertainty cancels this
+        # one-shot countdown permanently; only a new managed return can rearm it.
+        if connected or others or mode != 'game':
+            self.suspend_at = None
         if self.transition:
             if mode == self.transition:
                 target = self.transition
                 self.transition = ''
                 if target == 'game':
                     self.owned = False
-                    self.auth_cutoff = now
+                    # Accept authentication arriving during the return switch.
+                    self.auth_cutoff = self.requested_at
                     self.connected_since = None
                     self.disconnected_since = None
+                    if not connected and not others:
+                        self.suspend_at = now + SUSPEND_DELAY
             elif now - self.requested_at >= SWITCH_TIMEOUT:
                 self.paused_reason = f'{self.transition} switch not observed within {SWITCH_TIMEOUT}s'
             return None
@@ -162,7 +172,10 @@ class Policy:
             self.disconnected_since = None
             if self.owned:
                 self.paused_reason = 'KDE was left outside automation; respecting manual override'
+                self.suspend_at = None
                 return None
+            if self.suspend_at is not None and now >= self.suspend_at:
+                return 'suspend'
             if connected and latest_auth >= self.auth_cutoff:
                 if self.connected_since is None:
                     self.connected_since = now
@@ -182,6 +195,9 @@ class Policy:
         return None
 
     def requested(self, target, now):
+        self.suspend_at = None
+        if target == 'suspend':
+            return  # Consume before submission so waking never causes resuspend.
         self.transition = target
         self.requested_at = now
         self.connected_since = None
@@ -216,6 +232,16 @@ def switch(target):
         log(output[:500])
 
 
+def suspend():
+    # Respect inhibitors and authorization. Never force sleep or prompt from
+    # the background. Submit asynchronously so time asleep cannot time out us.
+    args = ['systemctl', '--no-ask-password', '--check-inhibitors=yes',
+            '--no-block', 'suspend']
+    log('REQUESTING SUSPEND: ' + ' '.join(args))
+    command(args)
+    log('Suspend request submitted; countdown consumed (no automatic retry)')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dry-run', action='store_true', help='log proposed actions only; never switch or save live state')
@@ -233,7 +259,11 @@ def main():
     lock = (STATE_DIR / ('dry-run.lock' if args.dry_run else 'watcher.lock')).open('w')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     policy = Policy() if args.dry_run else load()
-    log('DRY RUN: no switches' if args.dry_run else 'Watcher active: authenticated connect -> KDE, confirmed idle -> game')
+    if policy.suspend_at is not None:
+        log('Cancelled pending suspend on watcher startup')
+        policy.suspend_at = None
+    log('DRY RUN: no switches or suspend' if args.dry_run else
+        'Watcher active: authenticated connect -> KDE, confirmed idle -> game -> suspend after 30s')
     last_status = None
     try:
         while True:
@@ -241,6 +271,9 @@ def main():
                 paused_file = STATE_DIR / 'paused'
                 if paused_file.exists():
                     policy.connected_since = policy.disconnected_since = None
+                    policy.suspend_at = None
+                    if not args.dry_run:
+                        save(policy)
                     status = ('paused by user',)
                 else:
                     pid, (connected, others, latest, total) = connection_snapshot()
@@ -251,27 +284,51 @@ def main():
                         policy.paused_reason = 'Jump access log rotated or truncated; connection history is uncertain'
                     policy.log_identity = identity
                     policy.log_size = log_stat.st_size
-                    if policy.jump_pid and policy.jump_pid != pid and policy.owned:
-                        policy.paused_reason = 'Jump restarted while KDE was managed; connection history is uncertain'
+                    if policy.jump_pid and policy.jump_pid != pid and (policy.owned or policy.suspend_at is not None):
+                        policy.paused_reason = 'Jump restarted during managed workflow; connection history is uncertain'
                     policy.jump_pid = pid
+                    previous_suspend = policy.suspend_at
                     action = policy.step(time.monotonic(), mode, connected, others, latest)
-                    status = (mode, connected, others, total, policy.owned, policy.transition, policy.paused_reason)
+                    sleep_disabled = (STATE_DIR / 'no-suspend').exists()
+                    if sleep_disabled:
+                        policy.suspend_at = None
+                        if action == 'suspend':
+                            action = None
+                    if policy.suspend_at != previous_suspend:
+                        log('Suspend scheduled in 30 seconds; reconnect to cancel' if policy.suspend_at is not None
+                            else 'Pending suspend cancelled')
+                    status = (mode, connected, others, total, policy.owned, policy.transition,
+                              policy.paused_reason, policy.suspend_at, sleep_disabled)
                     if action:
                         if args.dry_run:
-                            status += ('would switch to ' + action,)
+                            status += ('would ' + ('suspend' if action == 'suspend' else 'switch to ' + action),)
                         else:
                             # Check again immediately before a potentially destructive action.
                             pid2, (connected2, others2, latest2, total2) = connection_snapshot()
                             mode2 = session_mode()
-                            if (pid2, connected2, others2, mode2) != (pid, connected, others, mode) or (action == 'desktop' and latest2 < policy.auth_cutoff):
-                                log('State changed before switch; deferring')
+                            stat2 = ACCESS_LOG.stat()
+                            history_changed = (f'{stat2.st_dev}:{stat2.st_ino}' != policy.log_identity
+                                               or stat2.st_size < policy.log_size)
+                            if (paused_file.exists() or history_changed
+                                    or (pid2, connected2, others2, mode2) != (pid, connected, others, mode)
+                                    or (action == 'desktop' and latest2 < policy.auth_cutoff)):
+                                policy.suspend_at = None
+                                save(policy)
+                                log('State changed before action; deferring and cancelling any pending suspend')
+                                continue
+                            if action == 'suspend' and (STATE_DIR / 'no-suspend').exists():
+                                policy.suspend_at = None
+                                save(policy)
                                 continue
                             policy.requested(action, time.monotonic())
-                            save(policy)  # Persist loop guard before terminating the graphical session.
+                            save(policy)  # Persist loop guard / consume sleep before submitting action.
                             try:
-                                switch(action)
+                                if action == 'suspend':
+                                    suspend()
+                                else:
+                                    switch(action)
                             except Exception as exc:
-                                policy.paused_reason = 'Switch failed; no automatic retries: ' + str(exc)
+                                policy.paused_reason = 'Action failed; no automatic retries: ' + str(exc)
                                 log(policy.paused_reason)
                             save(policy)
                     if not args.dry_run:
@@ -282,6 +339,11 @@ def main():
             except Exception as exc:
                 # Never interpret unreadable/ambiguous state as a disconnect.
                 policy.connected_since = policy.disconnected_since = None
+                if policy.suspend_at is not None:
+                    policy.suspend_at = None
+                    if not args.dry_run:
+                        save(policy)
+                    log('Pending suspend cancelled because state is uncertain')
                 status = ('inhibited', str(exc))
                 if status != last_status:
                     log('INHIBITED: ' + str(exc))

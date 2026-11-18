@@ -20,6 +20,9 @@ will request KDE after about 5 seconds. Session switching can close all running
 games/applications and lose unsaved work. Jump may disconnect. Reconnect manually.
 This cannot guarantee remote access to the replacement session.
 
+Automatic suspend is enabled by default. A working Wake-on-LAN (or other wake)
+solution is required: Jump alone cannot connect while the PC is asleep.
+
 ## Behavior
 
 - Replay /var/log/jump-connect/access.log for the currently running Jump service.
@@ -28,6 +31,17 @@ This cannot guarantee remote access to the replacement session.
 - Wait at least 5 minutes after that switch request before considering a return.
 - Once all connections are closed for at least 2 minutes, return using
   `steamosctl switch-to-game-mode`.
+- After Gaming Mode is confirmed, start a 30-second suspend countdown. A Jump
+  connection or connection attempt during that window cancels sleep. Only an
+  automatic return from a managed KDE session arms this one-shot countdown;
+  ordinary Gaming Mode startup does not.
+- Suspend using `systemctl --no-ask-password --check-inhibitors=yes --no-block suspend`.
+  Respect sleep inhibitors and authorization; do not force sleep or install
+  special privileges. Submission is asynchronous; the system journal records
+  whether sleep actually succeeds. Failure does not cause repeated attempts.
+- The countdown is consumed before requesting suspend, so waking by WoL does
+  not immediately put the PC back to sleep. A watcher restart, manual pause,
+  unknown state, or departure from Gaming Mode also cancels pending sleep.
 - Reconnecting cancels the disconnect countdown. Multiple connections must all end.
 - Only return automatically from KDE opened by this watcher. A KDE session that
   was already running when the watcher started is not claimed or closed.
@@ -49,8 +63,10 @@ The code is deliberately fail-closed rather than trying to recover every case.
 ```sh
 bash ~/jump-mode.sh status    # service + read-only session/connection snapshot
 bash ~/jump-mode.sh logs      # last 50 watcher journal records
-bash ~/jump-mode.sh pause     # no future switches while manually paused
+bash ~/jump-mode.sh pause     # pause switching and cancel pending suspend
 bash ~/jump-mode.sh resume    # resume, unless a safety fault is recorded
+bash ~/jump-mode.sh sleep-off # disable only automatic suspend (persistent)
+bash ~/jump-mode.sh sleep-on  # enable suspend for the next managed return
 bash ~/jump-mode.sh disable   # stop and disable only our watcher
 bash ~/jump-mode.sh reset     # stop watcher, archive its state, clear pause
 ```
@@ -59,6 +75,9 @@ After a safety fault, inspect logs, then use `reset` followed by `enable`. Reset
 in KDE relinquishes ownership: the watcher will not automatically close that KDE
 session. None of the disable/pause/reset commands switches the current session.
 A switch already submitted to SteamOS Manager cannot necessarily be cancelled.
+Likewise, a suspend request already submitted to logind cannot necessarily be
+cancelled. Pause/sleep-off are checked again immediately before submission, but
+there is an unavoidable small race between the last check and the request.
 
 ## Rollback
 
@@ -90,7 +109,10 @@ python3 watcher.py --once
 python3 watcher.py --dry-run
 ```
 
-Unit tests and a live, read-only dry run have passed. Neither direction of the
-actual session switch has yet been integration-tested. Dry-run prints intended
-actions but never invokes steamosctl or writes the live policy state. Ctrl+C stops
-it. Do not mistake simulated transitions for validated session switching.
+Unit tests and a live, read-only dry run have passed. Both session-switch directions
+were subsequently verified in the live journal, including disconnect -> Gaming
+Mode and reconnect -> KDE. Suspend policy and command arguments are unit-tested
+with the suspend command mocked; actual suspend/resume has not yet been tested.
+Dry-run prints intended actions but never invokes steamosctl, submits suspend,
+or writes the live policy state. Ctrl+C stops it. Do not mistake simulated
+transitions for validated suspend/resume.
