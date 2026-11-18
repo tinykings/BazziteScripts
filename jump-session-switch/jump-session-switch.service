@@ -1,0 +1,16 @@
+[Unit]
+Description=Switch Bazzite sessions for authenticated Jump Desktop connections
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u %h/.local/share/jump-session-switch/watcher.py
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
